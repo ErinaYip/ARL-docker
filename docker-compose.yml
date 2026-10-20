@@ -1,88 +1,134 @@
-version: '3'
+# ARL (灯塔) 3 服务部署 —— 已适配 NixOS + rootless Podman
+#
+# 启动:  docker-compose up -d        （或 podman compose up -d）
+# 停止:  docker-compose down
+# 日志:  docker-compose logs -f web worker scheduler
+#
+# 与 Docker 原版的差异:
+#   * arl_db 不再是 external 卷，compose 首次启动自动创建（无需手动 docker volume create）
+#   * 日志改为 named volume（容器内写 /var/log/arl），不再 bind-mount 宿主上的空文件，
+#     避免 rootless 映射下「文件属主不对 / 宿主文件不存在被当成目录」的报错
+#   * 配置以 :ro 只读挂载，避免容器回写宿主的 config-docker.yaml
+#   * mongo / rabbitmq 加了 healthcheck，web/worker/scheduler 等它们真正就绪再启动
+
+name: arl
+
+x-arl-common: &arl-common
+  image: honmashironeko/arl-docker-all
+  restart: unless-stopped
+  environment:
+    - LANG=en_US.UTF-8
+    - TZ=Asia/Shanghai
+
+services:
+  web:
+    <<: *arl-common
+    container_name: arl_web
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      # https 服务（80 端口在容器内由 nginx 提供前端，如需 http 再放开 5003:80）
+      - "5003:443"
+    volumes:
+      - arl_log:/var/log/arl
+      - ./config-docker.yaml:/code/app/config.yaml:ro
+      - arl_image:/code/app/tmp_screenshot
+      - arl_poc:/opt/ARL-NPoC/xing/plugins/upload_poc
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        gen_crt.sh
+        nginx
+        wait-for-it.sh mongodb:27017 -t 0
+        wait-for-it.sh rabbitmq:5672 -t 0
+        exec gunicorn -b 0.0.0.0:5003 app.main:arl_app -w 3 --access-logfile /var/log/arl/arl_web.log
+
+  worker:
+    <<: *arl-common
+    container_name: arl_worker
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - arl_log:/var/log/arl
+      - ./config-docker.yaml:/code/app/config.yaml:ro
+      - arl_image:/code/app/tmp_screenshot
+      - arl_poc:/opt/ARL-NPoC/xing/plugins/upload_poc
+    entrypoint:
+      - sh
+      - -c
+      - |
+        wait-for-it.sh mongodb:27017 -t 0
+        wait-for-it.sh rabbitmq:5672 -t 0
+        celery -A app.celerytask.celery worker -l info -Q arlgithub -n arlgithub -c 2 -O fair -f /var/log/arl/arl_worker.log &
+        exec celery -A app.celerytask.celery worker -l info -Q arltask -n arltask -c 2 -O fair -f /var/log/arl/arl_worker.log
+
+  scheduler:
+    <<: *arl-common
+    container_name: arl_scheduler
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - arl_log:/var/log/arl
+      - ./config-docker.yaml:/code/app/config.yaml:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        wait-for-it.sh mongodb:27017 -t 0
+        wait-for-it.sh rabbitmq:5672 -t 0
+        exec python3.6 -m app.scheduler
+
+  mongodb:
+    image: mongo:4.0.27
+    container_name: arl_mongodb
+    restart: unless-stopped
+    volumes:
+      - arl_db:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    environment:
+      - MONGO_INITDB_DATABASE=arl
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=admin
+    healthcheck:
+      test: ["CMD", "mongo", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:3.8.19-management-alpine
+    container_name: arl_rabbitmq
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_DEFAULT_USER=arl
+      - RABBITMQ_DEFAULT_PASS=arlpassword
+      - RABBITMQ_DEFAULT_VHOST=arlv2host
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1M"
+        max-file: "10"
 
 volumes:
   arl_db:
-    external: true
-
-services:
-    web:
-        image: honmashironeko/arl-docker-all
-        container_name: arl_web
-        restart: unless-stopped
-        depends_on:
-          - mongodb
-          - rabbitmq
-        ports:
-          #http 服务，默认不映射出来
-          #- "5003:80"
-          - "5003:443"
-        volumes:
-          - ./arl_web.log:/code/arl_web.log
-          - ./config-docker.yaml:/code/app/config.yaml
-          - ./image:/code/app/tmp_screenshot
-          - ./poc:/opt/ARL-NPoC/xing/plugins/upload_poc
-        entrypoint: ["sh", "-c", "gen_crt.sh; nginx; wait-for-it.sh mongodb:27017; wait-for-it.sh rabbitmq:5672; gunicorn -b 0.0.0.0:5003 app.main:arl_app -w 3 --access-logfile arl_web.log"]
-        environment:
-          - LANG=en_US.UTF-8
-          - TZ=Asia/Shanghai
-
-    worker:
-        image: honmashironeko/arl-docker-all
-        container_name: arl_worker
-        restart: unless-stopped
-        depends_on:
-          - mongodb
-          - rabbitmq
-        volumes:
-          - ./arl_worker.log:/code/arl_worker.log
-          - ./config-docker.yaml:/code/app/config.yaml
-          - ./image:/code/app/tmp_screenshot
-          - ./poc:/opt/ARL-NPoC/xing/plugins/upload_poc
-        entrypoint: ["sh", "-c", "wait-for-it.sh mongodb:27017; wait-for-it.sh rabbitmq:5672;
-        celery -A app.celerytask.celery worker -l info -Q arlgithub -n arlgithub -c 2 -O fair -f arl_worker.log &
-         celery -A app.celerytask.celery worker -l info -Q arltask -n arltask -c 2 -O fair -f arl_worker.log"]
-
-        environment:
-          - LANG=en_US.UTF-8
-          - TZ=Asia/Shanghai
-
-    scheduler:
-      image: honmashironeko/arl-docker-all
-      container_name: arl_scheduler
-      restart: unless-stopped
-      depends_on:
-        - mongodb
-        - rabbitmq
-      volumes:
-        - ./config-docker.yaml:/code/app/config.yaml
-      entrypoint: [ "sh", "-c", "wait-for-it.sh mongodb:27017; wait-for-it.sh rabbitmq:5672; python3.6 -m app.scheduler" ]
-      environment:
-        - LANG=en_US.UTF-8
-        - TZ=Asia/Shanghai
-
-    mongodb:
-        image: mongo:4.0.27
-        container_name: arl_mongodb
-        restart: always
-        volumes:
-          - arl_db:/data/db
-          - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
-        environment:
-          - MONGO_INITDB_DATABASE=arl
-          - MONGO_INITDB_ROOT_USERNAME=admin
-          - MONGO_INITDB_ROOT_PASSWORD=admin
-
-
-    rabbitmq:
-      image: rabbitmq:3.8.19-management-alpine
-      container_name: arl_rabbitmq
-      restart: always
-      environment:
-        - RABBITMQ_DEFAULT_PASS=arlpassword
-        - RABBITMQ_DEFAULT_USER=arl
-        - RABBITMQ_DEFAULT_VHOST=arlv2host
-      logging:
-        driver: "json-file"
-        options:
-          max-size: "1M"
-          max-file: "10"
+  arl_log:
+  arl_image:
+  arl_poc:
